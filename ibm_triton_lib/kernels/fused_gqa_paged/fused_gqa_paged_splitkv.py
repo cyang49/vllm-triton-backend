@@ -421,8 +421,8 @@ def triton_fused_gqa_merge_sb_splitkv(
 
 # for vllm triton backend compatibility
 def paged_attention_triton_3d(
-    o,  # [B, G*H, D]
-    q,  # [B, G*H, D]
+    o,  # [B, G*H*Q, D]
+    q,  # [B, G*H*Q, D]
     k,  # [num_blocks, G, D, PAGE_SIZE]
     v,  # [num_blocks, G, D, PAGE_SIZE]
     sm_scale,
@@ -447,7 +447,7 @@ def paged_attention_triton_3d(
     H = num_queries_per_kv
     assert num_query_heads % num_queries_per_kv == 0
     G = num_query_heads // num_queries_per_kv  # num_kv_heads
-    Q = 1
+    Q = q.shape[1] // num_query_heads
     D = head_size
     PAGE_SIZE = block_size
 
