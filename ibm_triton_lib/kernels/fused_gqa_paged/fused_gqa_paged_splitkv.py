@@ -212,18 +212,6 @@ def triton_fused_gqa_paged_splitkv(
     return
 
 
-# doesn't currently work with torch 2.5.1 (we could just implement kernel instead of using compile?)
-# @torch.compile
-def torch_fused_gqa_reduce_splitkv(o_split, m_i_split, l_i_split, o_dtype):
-    g_m = (m_i_split.max(dim=1, keepdim=True)).values  # [P, 1, S]
-    alpha = torch.exp2(m_i_split - g_m)  # [P, SPLIT_L, S]
-    l_sum = l_i_split * alpha  # [P, SPLIT_L, S]
-    g_sum = l_sum.sum(dim=1)  # [P, S]
-    o = torch.mul(o_split, alpha[:, :, :, None]).sum(dim=1)  # [P, S, D]
-    o /= g_sum[:, :, None]
-    return o.to(o_dtype)
-
-
 # 2nd stage reduction kernel for regular softmax attention
 @triton.jit
 def triton_fused_gqa_reduce_splitkv(
@@ -299,26 +287,6 @@ def triton_fused_gqa_reduce_splitkv(
         tl.store(o_ptrs, o.to(o_dtype), mask=ss_mask[:, None])
 
     return
-
-
-# @torch.compile
-def torch_fused_gqa_merge_sb_splitkv(o_split, neg_loc_acc_split, o_dtype):
-    neg_loc_acc_clone = torch.empty_like(neg_loc_acc_split)
-    neg_loc_acc_clone[:, :-1, ...] = neg_loc_acc_split[:, 1:, ...]
-    neg_loc_acc_clone[:, -1, ...] = 0
-    neg_loc_acc_clone = (
-        torch.sum(neg_loc_acc_clone, dim=1, keepdim=True)
-        - torch.cumsum(neg_loc_acc_clone, dim=1)
-        + neg_loc_acc_clone
-    )
-
-    rem_split = torch.exp2(neg_loc_acc_clone)
-    o_split = o_split * rem_split[..., None]
-    o = o_split.sum(dim=1)
-    neg_loc_acc = neg_loc_acc_split.sum(dim=1)
-    rem = torch.exp2(neg_loc_acc)
-
-    return o.to(o_dtype), rem, neg_loc_acc
 
 
 # 2nd stage reduction kernel for stickbreaking attention
@@ -441,7 +409,6 @@ def paged_attention_triton_3d(
     quantize_p: bool = False,
     stickbreaking: bool = False,
     sb_add_rem: bool = False,
-    use_torch_2nd_stage_impl: bool = False,
 ):
     B = num_seqs
     H = num_queries_per_kv
@@ -539,78 +506,56 @@ def paged_attention_triton_3d(
     )
 
     # 2nd Stage
-    if use_torch_2nd_stage_impl:
-        if not stickbreaking:
-            output = torch_fused_gqa_reduce_splitkv(
-                o_split=o_split,
-                m_i_split=m_i_split,
-                l_i_split=l_i_split,
-                o_dtype=o_dtype,
-            )
-        else:
-            assert (
-                not sb_add_rem
-            ), "add remainder not supported by the torch 2nd stage impl"
-            output, rem, _ = torch_fused_gqa_merge_sb_splitkv(
-                o_split=o_split,
-                neg_loc_acc_split=l_i_split,
-                o_dtype=o_dtype,
-            )
-            # FIXME need to support remainder addition with paged v
-            # rem = rem.reshape([B, G])
-            # o = o + rem[..., None] * (v[:, :, -1:, :] if Q == 1 else v)
-        output.copy_(o.reshape(output.shape))
+    grid2 = (math.ceil(S / BLOCK_S), P, 1)
+    o = o.reshape([P, S, D])
+    if not stickbreaking:
+        triton_fused_gqa_reduce_splitkv[grid2](
+            o,
+            o_split,
+            m_i_split,
+            l_i_split,
+            o.stride(0),
+            o.stride(1),
+            o_split.stride(0),
+            o_split.stride(1),
+            o_split.stride(2),
+            m_i_split.stride(0),
+            m_i_split.stride(1),
+            l_i_split.stride(0),
+            l_i_split.stride(1),
+            D,
+            S,
+            BLOCK_S,
+            BLOCK_SS,
+            NUM_SPLITS,
+        )
     else:
-        grid2 = (math.ceil(S / BLOCK_S), P, 1)
-        o = o.reshape([P, S, D])
-        if not stickbreaking:
-            triton_fused_gqa_reduce_splitkv[grid2](
-                o,
-                o_split,
-                m_i_split,
-                l_i_split,
-                o.stride(0),
-                o.stride(1),
-                o_split.stride(0),
-                o_split.stride(1),
-                o_split.stride(2),
-                m_i_split.stride(0),
-                m_i_split.stride(1),
-                l_i_split.stride(0),
-                l_i_split.stride(1),
-                D,
-                S,
-                BLOCK_S,
-                BLOCK_SS,
-                NUM_SPLITS,
-            )
-        else:
-            triton_fused_gqa_merge_sb_splitkv[grid2](
-                o,
-                o_split,
-                l_i_split,
-                v,
-                block_tables,
-                context_lens,
-                o.stride(0),
-                o.stride(1),
-                o_split.stride(0),
-                o_split.stride(1),
-                o_split.stride(2),
-                l_i_split.stride(0),
-                l_i_split.stride(1),
-                v.stride(0),
-                v.stride(1),
-                v.stride(2),
-                block_tables.stride(0),
-                G,
-                D,
-                S,
-                BLOCK_S,
-                BLOCK_SS,
-                PAGE_SIZE,
-                NUM_SPLITS,
-                ADD_REM=sb_add_rem,
-            )
+        triton_fused_gqa_merge_sb_splitkv[grid2](
+            o,
+            o_split,
+            l_i_split,
+            v,
+            block_tables,
+            context_lens,
+            o.stride(0),
+            o.stride(1),
+            o_split.stride(0),
+            o_split.stride(1),
+            o_split.stride(2),
+            l_i_split.stride(0),
+            l_i_split.stride(1),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            block_tables.stride(0),
+            G,
+            D,
+            S,
+            BLOCK_S,
+            BLOCK_SS,
+            PAGE_SIZE,
+            NUM_SPLITS,
+            ADD_REM=sb_add_rem,
+        )
 
     return
