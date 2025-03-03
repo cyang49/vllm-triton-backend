@@ -446,7 +446,7 @@ def paged_attention_triton_3d(
     # NUM_SPLITS specifies number of partitions along kvlen. It doesn't need to be power of 2
     # ** this can be autotuned **
     NUM_SPLITS = (
-        compute_split_l(L, PAGE_SIZE, P) if force_split_l == None else force_split_l
+        compute_split_l(L, PAGE_SIZE, P*math.ceil(S / BLOCK_S)) if force_split_l == None else force_split_l
     )
 
     # Placeholder for intermediate results in different splits
